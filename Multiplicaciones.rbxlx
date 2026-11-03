@@ -1,0 +1,376 @@
+<?xml version='1.0' encoding='utf-8'?>
+<roblox version="4">
+  <External>null</External>
+  <External>nil</External>
+  <Item class="ServerScriptService" referent="RBXServerScriptService">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="ModuleScript" referent="RBXRules">
+      <Properties>
+        <string name="Name">Rules</string>
+        <ProtectedString name="Source">-- ModuleScript: reglas sin interfaz ni servicios; fáciles de probar.
+local Rules = {}
+Rules.Config = {
+    MinFactor = 0, MaxFactor = 9,
+    RoundSeconds = 20, RoundsPerMatch = 10,
+    CountdownSeconds = 5, RevealSeconds = 3, ResultsSeconds = 8,
+    PracticeSolo = false, -- true permite probar con un solo jugador.
+}
+
+function Rules.makeQuestion(randomInteger)
+    local a = randomInteger(Rules.Config.MinFactor, Rules.Config.MaxFactor)
+    local b = randomInteger(Rules.Config.MinFactor, Rules.Config.MaxFactor)
+    return a, b, a * b
+end
+
+function Rules.validAnswer(value)
+    return type(value) == "number" and value == value
+        and value &gt;= 0 and value &lt;= Rules.Config.MaxFactor ^ 2
+        and value % 1 == 0
+end
+
+-- No cede ejecución: solo el primer acierto puede cerrar la ronda.
+function Rules.submit(round, userId, teamName, answer, now)
+    if not round.open or now &gt;= round.deadline then return false, "La ronda terminó." end
+    if teamName ~= "Azul" and teamName ~= "Rojo" then return false, "No tienes equipo." end
+    if not Rules.validAnswer(answer) then return false, "Respuesta inválida." end
+    if round.attempts[userId] then return false, "Ya respondiste en esta ronda." end
+    round.attempts[userId] = true
+    if answer ~= round.answer then return false, "Esta vez no. Espera la próxima pregunta." end
+    round.open = false
+    return true, "¡Correcto! Un punto para tu equipo."
+end
+return Rules
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="Script" referent="RBXGameServer">
+      <Properties>
+        <string name="Name">GameServer</string>
+        <ProtectedString name="Source">-- Script en ServerScriptService. El servidor decide preguntas, tiempo y puntos.
+local Players = game:GetService("Players")
+local Teams = game:GetService("Teams")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Rules = require(script.Parent:WaitForChild("Rules"))
+local C = Rules.Config
+local rng = Random.new()
+
+local folder = Instance.new("Folder")
+folder.Name = "MultiplicationRemotes"
+local function remote(name)
+    local event = Instance.new("RemoteEvent")
+    event.Name = name
+    event.Parent = folder
+    return event
+end
+local stateEvent = remote("State")
+local answerEvent = remote("Answer")
+local feedbackEvent = remote("Feedback")
+local readyEvent = remote("Ready")
+local teamList = {}
+for _, info in ipairs({{"Azul", "Bright blue"}, {"Rojo", "Bright red"}}) do
+    local team = Instance.new("Team")
+    team.Name = info[1]
+    team.TeamColor = BrickColor.new(info[2])
+    team.AutoAssignable = false
+    team.Parent = Teams
+    teamList[#teamList + 1] = team
+end
+local scores = {Azul = 0, Rojo = 0}
+local phase, message, number, roundId = "Waiting", "Esperando un jugador en cada equipo…", 0, 0
+local round, phaseDeadline = nil, 0
+local lastAnswer, lastReady = {}, {}
+local function clock() return workspace:GetServerTimeNow() end
+local function snapshot(player)
+    return {
+        phase = phase, message = message, number = number, total = C.RoundsPerMatch,
+        roundId = roundId, a = round and round.a, b = round and round.b,
+        deadline = phaseDeadline, blue = scores.Azul, red = scores.Rojo,
+        team = player.Team and player.Team.Name or "Sin equipo",
+        attempted = round ~= nil and round.attempts[player.UserId] == true,
+        practice = C.PracticeSolo,
+    }
+end
+local function broadcast()
+    for _, player in ipairs(Players:GetPlayers()) do
+        stateEvent:FireClient(player, snapshot(player))
+    end
+end
+local function enoughPlayers()
+    if C.PracticeSolo then return #Players:GetPlayers() &gt;= 1 end
+    return #teamList[1]:GetPlayers() &gt;= 1 and #teamList[2]:GetPlayers() &gt;= 1
+end
+local function addPlayer(player)
+    player.Team = #teamList[1]:GetPlayers() &lt;= #teamList[2]:GetPlayers() and teamList[1] or teamList[2]
+    player.Neutral = false
+end
+Players.PlayerAdded:Connect(addPlayer)
+for _, player in ipairs(Players:GetPlayers()) do addPlayer(player) end
+Players.PlayerRemoving:Connect(function(player)
+    lastAnswer[player], lastReady[player] = nil, nil
+end)
+-- El cliente se suscribe antes de pedir el estado: funciona si entra a mitad de partida.
+readyEvent.OnServerEvent:Connect(function(player)
+    local now = clock()
+    if now - (lastReady[player] or -math.huge) &lt; 1 then return end
+    lastReady[player] = now
+    stateEvent:FireClient(player, snapshot(player))
+end)
+answerEvent.OnServerEvent:Connect(function(player, submittedId, answer)
+    local now = clock()
+    if now - (lastAnswer[player] or -math.huge) &lt; 0.25 then return end
+    lastAnswer[player] = now
+    if phase ~= "Question" or not round or submittedId ~= roundId then return end
+    if not enoughPlayers() then return end
+    local team = player.Team
+    if team ~= teamList[1] and team ~= teamList[2] then return end
+    local won, feedback = Rules.submit(round, player.UserId, team.Name, answer, now)
+    if won then
+        scores[team.Name] = scores[team.Name] + 1
+        phase = "Reveal"
+        phaseDeadline = now + C.RevealSeconds
+        message = string.format("¡Equipo %s gana un punto! %d × %d = %d", team.Name, round.a, round.b, round.answer)
+    end
+    broadcast()
+    feedbackEvent:FireClient(player, roundId, feedback)
+end)
+-- Publicar remotos solo después de conectar sus receptores.
+folder.Parent = ReplicatedStorage
+
+local function enter(newPhase, text, seconds)
+    phase, message = newPhase, text
+    phaseDeadline = seconds and (clock() + seconds) or 0
+    broadcast()
+end
+local function pause(seconds, requireTeams)
+    local finish = clock() + seconds
+    repeat
+        if requireTeams and not enoughPlayers() then return false end
+        task.wait(0.1)
+    until clock() &gt;= finish
+    return not requireTeams or enoughPlayers()
+end
+local function startQuestion()
+    local a, b, answer = Rules.makeQuestion(function(low, high) return rng:NextInteger(low, high) end)
+    roundId = roundId + 1
+    phaseDeadline = clock() + C.RoundSeconds
+    round = {a = a, b = b, answer = answer, deadline = phaseDeadline, open = true, attempts = {}}
+    phase, message = "Question", "Forma tu respuesta con las tarjetas y pulsa Enviar."
+    broadcast()
+end
+while true do
+    round, number = nil, 0
+    scores.Azul, scores.Rojo = 0, 0
+    enter("Waiting", "Esperando un jugador en cada equipo…")
+    repeat task.wait(0.25) until enoughPlayers()
+    enter("Countdown", "¡Prepárense! La partida va a comenzar.", C.CountdownSeconds)
+    local completed = pause(C.CountdownSeconds, true)
+    if completed then
+        for index = 1, C.RoundsPerMatch do
+            number = index
+            startQuestion()
+            while phase == "Question" and enoughPlayers() and clock() &lt; round.deadline do task.wait(0.05) end
+            if not enoughPlayers() then completed = false; break end
+            if phase == "Question" then
+                round.open = false
+                enter("Reveal", string.format("Tiempo terminado. %d × %d = %d", round.a, round.b, round.answer), C.RevealSeconds)
+            end
+            -- El plazo también puede haberse fijado en el receptor de un acierto.
+            if not pause(math.max(0, phaseDeadline - clock()), true) then completed = false; break end
+        end
+    end
+    if completed then
+        local result = "¡Empate!"
+        if scores.Azul &gt; scores.Rojo then result = "¡Ganó el equipo Azul!" end
+        if scores.Rojo &gt; scores.Azul then result = "¡Ganó el equipo Rojo!" end
+        enter("Results", result .. " La siguiente partida comenzará pronto.", C.ResultsSeconds)
+        pause(C.ResultsSeconds, false)
+    else
+        if round then round.open = false end
+        enter("Waiting", "Falta un equipo. Se reiniciará la partida.", 3)
+        pause(3, false)
+    end
+end
+</ProtectedString>
+      </Properties>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="RBXStarterPlayer">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="RBXStarterPlayerScripts">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="LocalScript" referent="RBXGameClient">
+        <Properties>
+          <string name="Name">GameClient</string>
+          <ProtectedString name="Source">-- LocalScript en StarterPlayer &gt; StarterPlayerScripts. Crea toda la pantalla.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local remotes = ReplicatedStorage:WaitForChild("MultiplicationRemotes")
+local stateEvent = remotes:WaitForChild("State")
+local answerEvent = remotes:WaitForChild("Answer")
+local feedbackEvent = remotes:WaitForChild("Feedback")
+local readyEvent = remotes:WaitForChild("Ready")
+local gui = Instance.new("ScreenGui")
+gui.Name = "MultiplicationGui"
+gui.ResetOnSpawn = false
+gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+local panel = Instance.new("Frame")
+panel.Size = UDim2.fromScale(0.94, 0.9)
+panel.Position = UDim2.fromScale(0.03, 0.05)
+panel.BackgroundColor3 = Color3.fromRGB(235, 244, 255)
+panel.Parent = gui
+local constraint = Instance.new("UISizeConstraint")
+constraint.MaxSize = Vector2.new(760, 760)
+constraint.Parent = panel
+panel.AnchorPoint = Vector2.new(0.5, 0.5)
+panel.Position = UDim2.fromScale(0.5, 0.5)
+local function text(name, y, height, size)
+    local label = Instance.new("TextLabel")
+    label.Name = name
+    label.Size = UDim2.fromScale(0.94, height)
+    label.Position = UDim2.fromScale(0.03, y)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(20, 40, 70)
+    label.Font = Enum.Font.GothamBold
+    label.TextScaled = true
+    label.TextWrapped = true
+    label.Parent = panel
+    local limit = Instance.new("UITextSizeConstraint")
+    limit.MaxTextSize = size
+    limit.Parent = label
+    return label
+end
+text("Title", 0.01, 0.07, 32).Text = "CARRERA DE MULTIPLICACIONES"
+local teamLabel = text("Team", 0.09, 0.05, 23)
+local score = text("Score", 0.15, 0.06, 28)
+local counter = text("Counter", 0.22, 0.05, 20)
+local question = text("Question", 0.28, 0.1, 48)
+local timer = text("Timer", 0.39, 0.05, 23)
+local message = text("Message", 0.45, 0.09, 22)
+local answerLabel = text("SelectedAnswer", 0.55, 0.07, 32)
+local state, selected, pending = nil, "", false
+local function enabled()
+    return state and state.phase == "Question" and not state.attempted and not pending
+        and workspace:GetServerTimeNow() &lt; state.deadline
+end
+local function displayAnswer() answerLabel.Text = "Tu respuesta: " .. (selected == "" and "___" or selected) end
+local function button(caption, x, y, width, action)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromScale(width, 0.095)
+    b.Position = UDim2.fromScale(x, y)
+    b.BackgroundColor3 = Color3.fromRGB(35, 96, 185)
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.Font = Enum.Font.GothamBold
+    b.TextScaled = true
+    b.Text = caption
+    b.Parent = panel
+    b.Activated:Connect(action)
+    return b
+end
+for digit = 0, 9 do
+    local value = tostring(digit)
+    button(value, 0.04 + (digit % 5) * 0.185, 0.64 + math.floor(digit / 5) * 0.11, 0.17, function()
+        if enabled() and #selected &lt; 2 then
+            selected = selected == "0" and value or selected .. value
+            displayAnswer()
+        end
+    end)
+end
+button("Borrar", 0.04, 0.87, 0.43, function()
+    if enabled() then selected = ""; displayAnswer() end
+end)
+local send = button("Enviar", 0.51, 0.87, 0.43, function()
+    if enabled() and selected ~= "" then
+        pending = true
+        answerEvent:FireServer(state.roundId, tonumber(selected))
+    end
+end)
+stateEvent.OnClientEvent:Connect(function(nextState)
+    if not state or nextState.roundId ~= state.roundId then selected = "" end
+    state, pending = nextState, false
+    teamLabel.Text = "Tu equipo: " .. state.team .. (state.practice and " • PRÁCTICA" or "")
+    score.Text = string.format("AZUL: %d     |     ROJO: %d", state.blue, state.red)
+    counter.Text = string.format("Pregunta %d de %d", state.number, state.total)
+    question.Text = state.a and string.format("%d × %d = ?", state.a, state.b) or "¡Jugamos en equipo!"
+    message.Text = state.message
+    if state.phase == "Question" and state.attempted then message.Text = "Ya respondiste. Espera la próxima pregunta." end
+    displayAnswer()
+end)
+feedbackEvent.OnClientEvent:Connect(function(id, feedback)
+    if state and state.roundId == id then pending = false; message.Text = feedback end
+end)
+RunService.Heartbeat:Connect(function()
+    if not state then timer.Text = "Conectando…"; return end
+    local remaining = math.max(0, math.ceil(state.deadline - workspace:GetServerTimeNow()))
+    timer.Text = state.deadline &gt; 0 and ("Tiempo: " .. remaining .. " s") or "Esperando equipos…"
+    send.BackgroundColor3 = enabled() and Color3.fromRGB(20, 135, 75) or Color3.fromRGB(110, 120, 130)
+end)
+displayAnswer()
+readyEvent:FireServer()
+</ProtectedString>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="Workspace" referent="RBXWorkspace">
+    <Properties>
+      <string name="Name">Workspace</string>
+    </Properties>
+    <Item class="Part" referent="RBXBaseplate">
+      <Properties>
+        <string name="Name">Baseplate</string>
+        <bool name="Anchored">true</bool>
+        <Vector3 name="size">
+          <X>160</X>
+          <Y>1</Y>
+          <Z>160</Z>
+        </Vector3>
+        <CoordinateFrame name="CFrame">
+          <X>0</X>
+          <Y>-1</Y>
+          <Z>0</Z>
+          <R00>1</R00>
+          <R01>0</R01>
+          <R02>0</R02>
+          <R10>0</R10>
+          <R11>1</R11>
+          <R12>0</R12>
+          <R20>0</R20>
+          <R21>0</R21>
+          <R22>1</R22>
+        </CoordinateFrame>
+      </Properties>
+    </Item>
+    <Item class="SpawnLocation" referent="RBXSpawnLocation">
+      <Properties>
+        <string name="Name">SpawnLocation</string>
+        <bool name="Anchored">true</bool>
+        <Vector3 name="size">
+          <X>6</X>
+          <Y>1</Y>
+          <Z>6</Z>
+        </Vector3>
+        <CoordinateFrame name="CFrame">
+          <X>0</X>
+          <Y>1</Y>
+          <Z>0</Z>
+          <R00>1</R00>
+          <R01>0</R01>
+          <R02>0</R02>
+          <R10>0</R10>
+          <R11>1</R11>
+          <R12>0</R12>
+          <R20>0</R20>
+          <R21>0</R21>
+          <R22>1</R22>
+        </CoordinateFrame>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
